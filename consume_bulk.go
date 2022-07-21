@@ -5,21 +5,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/lib/pq"
-	nsq "github.com/nsqio/go-nsq"
+	"github.com/nsqio/go-nsq"
 )
 
 var consumerChannel chan Log
+var done chan struct{}
 
 type Log struct {
 	IPAddress  string    `json:"ip_address"`
 	Payload    string    `json:"payload"`
 	StatusCode int       `json:"status_code"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type messageHandler struct{}
+
+// HandleMessage implements the Handler interface.
+func (h *messageHandler) HandleMessage(m *nsq.Message) error {
+	if len(m.Body) == 0 {
+		// Returning nil will automatically send a FIN command to NSQ to mark the message as processed.
+		// In this case, a message with an empty body is simply ignored/discarded.
+		return nil
+	}
+	otpLog := Log{}
+	err := json.Unmarshal(m.Body, &otpLog)
+	if err != nil {
+		return err
+	}
+	consumerChannel <- otpLog
+	return nil
 }
 
 func prepareQueryLog(data []Log) (string, []interface{}) {
@@ -39,22 +61,18 @@ func prepareQueryLog(data []Log) (string, []interface{}) {
 }
 
 func AddMongoBulk(conn *sql.DB, data []Log) {
-	query, params := prepareQueryLog(data)
-	_, err := conn.Exec(query, params...)
-	if err != nil {
-		fmt.Println(err.Error(), "INI ADALAH ERROR")
+	if len(data) > 0 {
+		query, params := prepareQueryLog(data)
+		_, err := conn.Exec(query, params...)
+		if err != nil {
+			// need to requeue the message, for now just print error
+			fmt.Println(err.Error())
+		}
+		fmt.Println("Inserted: ", len(data))
 	}
 }
 
-var handleMessage = func(msg *nsq.Message) error {
-	otpLog := Log{}
-	_ = json.Unmarshal(msg.Body, &otpLog)
-
-	consumerChannel <- otpLog
-	return nil
-}
-
-func consumeMessage() {
+func consumeMessage(wg *sync.WaitGroup) {
 	connectionString :=
 		fmt.Sprintf("user=%s password=%s dbname=%s sslmode=disable", "postgres", "", "postgres")
 
@@ -64,7 +82,7 @@ func consumeMessage() {
 	}
 
 	interval := time.NewTicker(time.Second * 10) // ticker of every 10 second
-	threshold := 1000
+	threshold := 10000
 	bulkArray := make([]Log, 0)
 
 	for {
@@ -79,34 +97,63 @@ func consumeMessage() {
 				AddMongoBulk(conn, bulkArray)
 				bulkArray = nil
 			}
+		case <-done:
+			log.Println("Goroutine Closed")
+			AddMongoBulk(conn, bulkArray)
+			wg.Done()
+
 		}
 	}
 }
 
-func InitNsqConsumer() {
+func main() {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
+
+	done = make(chan struct{})
 	consumerChannel = make(chan Log, 1) // channel of buffer 1, if buffer = 0, it will be a blocking channel
-	go consumeMessage()
 
-	nsqTopic := "otp_log_topic"
-	nsqChannel := "otp_log_channel"
-	consumer, err := nsq.NewConsumer(nsqTopic, nsqChannel, nsq.NewConfig())
+	go consumeMessage(wg)
 
+	config := nsq.NewConfig()
+	nsqTopic := "otp_log_topic_test"
+	nsqChannel := "otp_log_channel_test"
+	consumer, err := nsq.NewConsumer(nsqTopic, nsqChannel, config)
 	if err != nil {
-		log.Print("error create consumer")
+		log.Fatal(err)
 	}
-	consumer.AddHandler(nsq.HandlerFunc(handleMessage))
-	err = consumer.ConnectToNSQLookupd("127.0.0.1:4161")
+
+	consumer.AddHandler(&messageHandler{})
+	err = consumer.ConnectToNSQLookupd("localhost:4161")
 	if err != nil {
-		log.Print("error connecting to nsqlookupd")
-	} else {
-		log.Print("BERHASIL KONEK")
+		log.Fatal(err)
 	}
-	log.Println("Awaiting messages from NSQ topic \"otp_log_topic\"...")
+	start_time := time.Now()
+	log.Println(start_time.Local().String() + "Awaiting messages from NSQ topic: " + nsqTopic)
+
+	// wait for signal to exit
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+	done <- struct{}{}
+
+	// Gracefully stop the consumer.
+	consumer.Stop()
+	log.Println("Done")
 	wg.Wait()
 }
 
-func main() {
-	InitNsqConsumer()
-}
+// 1jt
+// 1000
+// 2022-07-21 08:21:42
+// 2022/07/21 08:22:51
+// 69 detik
+
+// 10000
+// 2022-07-21 08:32:11
+// 2022/07/21 08:33:39
+// 88 detik
+
+// 2022-07-21 08:28:19
+// 2022/07/21 08:31:27
+// 188 detik
